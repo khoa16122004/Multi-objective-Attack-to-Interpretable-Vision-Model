@@ -307,10 +307,11 @@ class NSGAII:
 
     def modify(self, pop, oimg, timg):
         wi = oimg.shape[2]
-        img = timg.clone()
-        p = np.where(pop == 0)
+        # Genome convention: 1 -> take pixel from timg (perturbed), 0 -> keep original pixel.
+        img = oimg.clone()
+        p = np.where(pop == 1)
         c1, c2 = self.convert1D_to_2D(p[0], wi)
-        img[:, :, c1, c2] = oimg[:, :, c1, c2]
+        img[:, :, c1, c2] = timg[:, :, c1, c2]
         return img
 
     def _forward_logits(self, x):
@@ -432,12 +433,12 @@ class NSGAII:
         return crowding
 
     def modify_population(self, population, oimg, timg):
-        batch = timg.repeat(len(population), 1, 1, 1)
+        batch = oimg.repeat(len(population), 1, 1, 1)
         wi = oimg.shape[2]
-        src = oimg[0]
+        src = timg[0]
 
         for i, pop in enumerate(population):
-            p = np.where(pop == 0)
+            p = np.where(pop == 1)
             c1, c2 = self.convert1D_to_2D(p[0], wi)
             batch[i, :, c1, c2] = src[:, c1, c2]
 
@@ -445,10 +446,11 @@ class NSGAII:
 
     def feval_population(self, population, oimg, timg, olabel, ref_topk_idx):
         xp = self.modify_population(population, oimg, timg)
-        explain_maps, logits = self._get_explain_map(xp, target_class=y)
+
+        explain_maps, logits = self._get_explain_map(xp, target_class=olabel)
+        inter_ratio = self._topk_intersection_ratio_batch(explain_maps, ref_topk_idx)
         y = torch.full((logits.size(0),), int(olabel), device=logits.device, dtype=torch.long)
         ce = self.ce_loss(logits, y)
-        inter_ratio = self._topk_intersection_ratio_batch(explain_maps, ref_topk_idx)
 
         return np.stack(
             [
@@ -466,18 +468,17 @@ class NSGAII:
         he = oimg.shape[3]
         base = np.zeros(wi * he).astype(int)
         idxs = self.masking(oimg, timg)
-        base[idxs] = 1
-
-        if base.sum() < self.n_pix:
-            self.n_pix = int(base.sum())
+        max_candidates = len(idxs)
+        if max_candidates < self.n_pix:
+            self.n_pix = int(max_candidates)
 
         pop = []
         for _ in range(self.pop_size):
             p = base.copy()
             if len(idxs) > 0 and self.n_pix > 0:
                 n = min(self.n_pix, len(idxs))
-                rm_idx = np.random.choice(idxs, n, replace=False)
-                p[rm_idx] = 0
+                add_idx = np.random.choice(idxs, n, replace=False)
+                p[add_idx] = 1
             pop.append(p)
         return pop
 

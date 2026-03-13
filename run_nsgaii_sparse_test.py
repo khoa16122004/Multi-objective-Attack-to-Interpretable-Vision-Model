@@ -4,11 +4,12 @@ import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from PIL import Image
 
 from algorithm import NSGAII
-from explain_method import get_gradcam_map
+from explain_method import get_gradcam_map, simple_gradient_map, integrated_gradients
 from util import get_torchvision_model
 
 
@@ -19,10 +20,10 @@ def parse_args():
     parser.add_argument("--dataset", type=str, default="imagenet", help="Dataset name.")
     parser.add_argument("--pretrained", action="store_true", default=True, help="Use pretrained weights.")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--n-pix", type=int, default=20, help="Number of pixel positions to flip per individual init.")
-    parser.add_argument("--pop-size", type=int, default=30)
+    parser.add_argument("--n-pix", type=int, default=40, help="Number of pixel positions to flip per individual init.")
+    parser.add_argument("--pop-size", type=int, default=50)
     parser.add_argument("--cr", type=float, default=0.9)
-    parser.add_argument("--mu", type=float, default=0.01)
+    parser.add_argument("--mu", type=float, default=0.9)
     parser.add_argument("--topk", type=int, default=1000)
     parser.add_argument(
         "--explain-method",
@@ -32,9 +33,9 @@ def parse_args():
         help="Explanation method for objective-2.",
     )
     parser.add_argument("--ig-steps", type=int, default=100, help="Used when explain-method=integrated_gradients.")
-    parser.add_argument("--max-query", type=int, default=10000, help="Maximum number of queries.")
+    parser.add_argument("--max-query", type=int, default=100000, help="Maximum number of queries.")
     parser.add_argument("--target-image", type=str, default="", help="Optional reference image path for sparse mixing.")
-    parser.add_argument("--noise-std", type=float, default=0.8, help="Used when target image is not provided.")
+    parser.add_argument("--noise-std", type=float, default=1.0, help="Used when target image is not provided.")
     parser.add_argument("--out-dir", type=str, default="eval_test")
     return parser.parse_args()
 
@@ -50,6 +51,25 @@ def to_vis_space(x, normtransform):
     mean = torch.tensor(normtransform.mean, device=x.device).view(1, -1, 1, 1)
     std = torch.tensor(normtransform.std, device=x.device).view(1, -1, 1, 1)
     return denorm_for_vis(x * std + mean)
+
+
+def get_explain_map_for_vis(model, model_name, x, label, method, ig_steps):
+    method = method.lower()
+    if method == "gradcam":
+        m, _ = get_gradcam_map(model, model_name, x, target_class=label)
+        return torch.as_tensor(m, device=x.device, dtype=torch.float32)
+    if method == "simple_gradient":
+        m, _ = simple_gradient_map(model, x, target_class=torch.tensor([label], device=x.device))
+        return m
+    if method == "integrated_gradients":
+        m, _ = integrated_gradients(
+            model,
+            x,
+            target_class=torch.tensor([label], device=x.device),
+            steps=ig_steps,
+        )
+        return m
+    raise ValueError("Unsupported explain method")
 
 
 def main():
@@ -108,10 +128,28 @@ def main():
         max_query=args.max_query,
     )
 
-    cam_o, _ = get_gradcam_map(model, args.model, oimg, target_class=olabel)
-    cam_a, adv_logits = get_gradcam_map(model, args.model, adv, target_class=olabel)
+    with torch.no_grad():
+        adv_logits = model(adv)
+
+    map_o = get_explain_map_for_vis(
+        model,
+        args.model,
+        oimg,
+        olabel,
+        args.explain_method,
+        args.ig_steps,
+    )
+    map_a = get_explain_map_for_vis(
+        model,
+        args.model,
+        adv,
+        olabel,
+        args.explain_method,
+        args.ig_steps,
+    )
 
     adv_pred = int(adv_logits.argmax(dim=1).item())
+    changed_pixels = int((adv[0] - oimg[0]).abs().sum(dim=0).gt(1e-8).sum().item())
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -149,12 +187,13 @@ def main():
     axes[0, 1].set_title(f"Adversarial (pred={adv_pred})")
     axes[0, 1].axis("off")
 
-    axes[1, 0].imshow(cam_o[0], cmap="hot")
-    axes[1, 0].set_title("Original Grad-CAM")
+    method_title = args.explain_method.replace("_", " ").title()
+    axes[1, 0].imshow(map_o[0].detach().cpu().numpy(), cmap="hot")
+    axes[1, 0].set_title(f"Original {method_title}")
     axes[1, 0].axis("off")
 
-    axes[1, 1].imshow(cam_a[0], cmap="hot")
-    axes[1, 1].set_title("Adversarial Grad-CAM")
+    axes[1, 1].imshow(map_a[0].detach().cpu().numpy(), cmap="hot")
+    axes[1, 1].set_title(f"Adversarial {method_title}")
     axes[1, 1].axis("off")
 
     plt.tight_layout()
@@ -167,13 +206,13 @@ def main():
         inter_curve = [h["best_intersection"] for h in attacker.history]
 
         fig2, axes2 = plt.subplots(1, 2, figsize=(10, 4))
-        axes2[0].plot(q, ce_curve, marker="o", linewidth=1.5)
+        axes2[0].plot(q, ce_curve, marker="", linewidth=1.5)
         axes2[0].set_title("Best CE vs Query")
         axes2[0].set_xlabel("Queries")
         axes2[0].set_ylabel("Cross-Entropy")
         axes2[0].grid(True, alpha=0.3)
 
-        axes2[1].plot(q, inter_curve, marker="o", linewidth=1.5)
+        axes2[1].plot(q, inter_curve, marker="", linewidth=1.5)
         axes2[1].set_title("Best Top-k Intersection vs Query")
         axes2[1].set_xlabel("Queries")
         axes2[1].set_ylabel("Intersection Ratio")
@@ -187,6 +226,7 @@ def main():
     print("Queries:", nqry)
     print("Original label:", olabel)
     print("Adversarial prediction:", adv_pred)
+    print("Changed pixels:", changed_pixels)
     print("Population size:", len(population))
     print("Rank-0 size:", len(rank0))
     print("Saved:", out_dir / "nsga2_sparse_result.png")
