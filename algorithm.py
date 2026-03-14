@@ -796,7 +796,7 @@ class NSGAII:
                     }
                 )
             
-            print("nqry: {}, best_ce: {:.4f}, best_intersection: {:.4f}".format(nqry, best_ce, best_inter))
+            # print("nqry: {}, best_ce: {:.4f}, best_intersection: {:.4f}".format(nqry, best_ce, best_inter))
 
         fronts = NonDominatedSorting().do(objectives, only_non_dominated_front=False)
         rank0 = fronts[0].tolist() if len(fronts) > 0 else []

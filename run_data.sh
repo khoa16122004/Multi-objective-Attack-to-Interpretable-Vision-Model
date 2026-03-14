@@ -48,14 +48,14 @@ export CUDA_VISIBLE_DEVICES=$BEST_GPU
 # =========================================================
 # CHẠY CODE
 # =========================================================
-# auto_low_region
+# auto_low_region, reference
 
 python main.py \
     --run-json-path model_evaluation_results/resnet18.json \
     --model resnet18 \
-    --n-pix 100 \
+    --n-pix 500 \
     --pop-size 50 \
-    --max-query 10000 \
+    --max-query 100000 \
     --explain-method simple_gradient \
     --intersec-mode auto_low_region \
     --output-root samples_100class_results
@@ -64,9 +64,9 @@ python main.py \
 python main.py \
     --run-json-path model_evaluation_results/resnet18.json \
     --model resnet18 \
-    --n-pix 100 \
+    --n-pix 500 \
     --pop-size 50 \
-    --max-query 10000 \
+    --max-query 100000 \
     --explain-method integrated_gradients \
     --intersec-mode auto_low_region \
     --output-root samples_100class_results
@@ -77,9 +77,9 @@ python main.py \
 python main.py \
     --run-json-path model_evaluation_results/resnet18.json \
     --model resnet18 \
-    --n-pix 100 \
+    --n-pix 500 \
     --pop-size 50 \
-    --max-query 10000 \
+    --max-query 100000 \
     --explain-method gradcam \
     --intersec-mode auto_low_region \
     --output-root samples_100class_results
