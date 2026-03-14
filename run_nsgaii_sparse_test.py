@@ -42,8 +42,43 @@ def parse_args():
         choices=["fixed", "generation"],
         help="Noise sampling mode: fixed once per run, or resample each generation.",
     )
+    parser.add_argument(
+        "--intersec-mode",
+        type=str,
+        default="reference",
+        choices=["reference", "target_region", "auto_low_region"],
+        help="Objective-2 mode: original reference overlap, manual target region, or auto low-saliency region.",
+    )
+    parser.add_argument(
+        "--target-region",
+        type=str,
+        default=None,
+        help="Target region bbox as 'y1,y2,x1,x2' when intersec-mode=target_region.",
+    )
+    parser.add_argument(
+        "--auto-region-percentile",
+        type=float,
+        default=30.0,
+        help="Percentile for auto_low_region (lower saliency area selection).",
+    )
+    parser.add_argument(
+        "--target-objective",
+        type=str,
+        default="maximize_target_intersection",
+        choices=["maximize_target_intersection", "maximize_target_importance"],
+        help="For target-region modes: maximize top-k overlap with target map, or maximize saliency importance in target region.",
+    )
     parser.add_argument("--out-dir", type=str, default="eval_test")
     return parser.parse_args()
+
+
+def parse_target_region(region_str):
+    if region_str is None:
+        return None
+    parts = [p.strip() for p in region_str.split(",") if p.strip() != ""]
+    if len(parts) != 4:
+        raise ValueError("--target-region must be in format 'y1,y2,x1,x2'")
+    return tuple(int(v) for v in parts)
 
 
 def denorm_for_vis(x):
@@ -80,6 +115,7 @@ def get_explain_map_for_vis(model, model_name, x, label, method, ig_steps):
 
 def main():
     args = parse_args()
+    target_region = parse_target_region(args.target_region)
 
     torch.manual_seed(args.seed)
 
@@ -115,6 +151,10 @@ def main():
         ig_steps=args.ig_steps,
         noise_std=args.noise_std,
         noise_mode=args.noise_mode,
+        intersec_mode=args.intersec_mode,
+        target_region=target_region,
+        auto_region_percentile=args.auto_region_percentile,
+        target_objective=args.target_objective,
         seed=args.seed,
     )
 

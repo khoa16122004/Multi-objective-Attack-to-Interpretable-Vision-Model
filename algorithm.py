@@ -254,6 +254,11 @@ class NSGAII:
         ig_steps=100,
         noise_std=1.0,
         noise_mode="generation",
+        rgb_mutation_std=None,
+        intersec_mode="reference",
+        target_region=None,
+        auto_region_percentile=30.0,
+        target_objective="maximize_target_intersection",
         seed=None,
     ):
         self.model = model
@@ -265,17 +270,38 @@ class NSGAII:
         self.topk = topk
         self.explain_method = explain_method
         self.ig_steps = ig_steps
+        # Keep parameter name for backward compatibility; it is now the RGB perturbation bound.
         self.noise_std = float(noise_std)
         self.noise_mode = str(noise_mode).lower()
+        self.rgb_mutation_std = (
+            float(rgb_mutation_std) if rgb_mutation_std is not None else max(1e-6, self.noise_std * 0.25)
+        )
+        self.intersec_mode = str(intersec_mode).lower()
+        self.target_region = target_region
+        self.auto_region_percentile = float(auto_region_percentile)
+        self.target_objective = str(target_objective).lower()
         self.seed = seed
 
         if self.noise_mode not in ("fixed", "generation"):
             raise ValueError("noise_mode must be one of: fixed, generation")
+        if self.intersec_mode not in ("reference", "target_region", "auto_low_region"):
+            raise ValueError("intersec_mode must be one of: reference, target_region, auto_low_region")
+        if self.target_objective not in ("maximize_target_intersection", "maximize_target_importance"):
+            raise ValueError(
+                "target_objective must be one of: maximize_target_intersection, maximize_target_importance"
+            )
+        if not (0.0 < self.auto_region_percentile < 100.0):
+            raise ValueError("auto_region_percentile must be in (0, 100)")
 
-        self.ce_loss = torch.nn.CrossEntropyLoss(reduction="none")
+        # Untargeted misclassification objective: minimize (logit_true - max_logit_other).
+        # Negative margin means prediction is already not the original class.
+        self.cls_margin_kappa = 0.0
 
-    def _sample_noise(self, oimg):
-        return torch.randn_like(oimg) * self.noise_std
+    def _init_rgb_population(self, oimg, psize):
+        c, h, w = oimg.shape[1], oimg.shape[2], oimg.shape[3]
+        if self.noise_std <= 0:
+            return torch.zeros((psize, c, h, w), device=oimg.device, dtype=oimg.dtype)
+        return (torch.rand((psize, c, h, w), device=oimg.device, dtype=oimg.dtype) * 2.0 - 1.0) * self.noise_std
 
     def convert1D_to_2D(self, idx, wi):
         c1 = idx // wi
@@ -290,12 +316,17 @@ class NSGAII:
         he = oimg.shape[3]
         return torch.arange(wi * he, device=oimg.device, dtype=torch.long)
 
-    def recombine(self, p1, p2):
+    def recombine(self, p1, p2, rgb1, rgb2):
         cross_points = torch.rand(p1.numel(), device=p1.device) < self.cr
         if not torch.any(cross_points):
             cross_points[torch.randint(0, p1.numel(), (1,), device=p1.device)] = True
         trial = torch.where(cross_points, p1, p2)
-        return self._project_sparse(trial)
+        child_mask = self._project_sparse(trial)
+
+        _, h, w = rgb1.shape
+        rgb_cross = cross_points.view(1, h, w)
+        child_rgb = torch.where(rgb_cross, rgb1, rgb2)
+        return child_mask, child_rgb
 
     def _project_sparse(self, p):
         outp = p.clone()
@@ -316,18 +347,32 @@ class NSGAII:
 
         return outp
 
-    def mutate(self, p):
+    def mutate(self, p, rgb):
         outp = p.clone()
         n_flip = int(max(1, round(outp.numel() * self.mu)))
         n_flip = min(n_flip, outp.numel())
         idx = torch.randperm(outp.numel(), device=outp.device)[:n_flip]
         outp[idx] = ~outp[idx]
-        return self._project_sparse(outp)
+        outp = self._project_sparse(outp)
 
-    def modify(self, pop, oimg, noise):
+        out_rgb = rgb.clone()
+        _, h, w = out_rgb.shape
+        n_rgb = int(max(1, round((h * w) * self.mu)))
+        n_rgb = min(n_rgb, h * w)
+        ridx = torch.randperm(h * w, device=out_rgb.device)[:n_rgb]
+        rgb_flat = out_rgb.view(out_rgb.shape[0], -1)
+        rgb_flat[:, ridx] += torch.randn(
+            (out_rgb.shape[0], n_rgb),
+            device=out_rgb.device,
+            dtype=out_rgb.dtype,
+        ) * self.rgb_mutation_std
+        out_rgb = rgb_flat.view_as(out_rgb).clamp(-self.noise_std, self.noise_std)
+        return outp, out_rgb
+
+    def modify(self, pop, oimg, perturb_rgb):
         # Genome convention: 1 -> perturb this pixel, 0 -> keep original pixel.
         mask = pop.view(1, 1, oimg.shape[2], oimg.shape[3])
-        perturbed = oimg + noise
+        perturbed = oimg + perturb_rgb.unsqueeze(0)
         img = torch.where(mask, perturbed, oimg)
         return img.clamp(oimg.min().item(), oimg.max().item())
 
@@ -358,6 +403,92 @@ class NSGAII:
         matches = (cur_idx.unsqueeze(2) == ref_idx.unsqueeze(1)).any(dim=2)
         inter_counts = matches.sum(dim=1).to(torch.float32)
         return inter_counts / float(ref_idx.size(1))
+
+    def _topk_in_region_ratio_batch(self, saliency_maps, region_mask):
+        if saliency_maps.ndim == 2:
+            saliency_maps = saliency_maps.unsqueeze(0)
+
+        flat = saliency_maps.reshape(saliency_maps.size(0), -1)
+        k = int(min(self.topk, flat.size(1)))
+        if k <= 0:
+            raise ValueError("topk must be >= 1")
+
+        cur_idx = torch.topk(flat, k=k, dim=1, largest=True).indices
+        region_flat = region_mask.reshape(-1).to(cur_idx.device)
+        in_region = region_flat[cur_idx]
+        return in_region.to(torch.float32).mean(dim=1)
+
+    def _build_target_region_mask(self, oimg):
+        h, w = oimg.shape[2], oimg.shape[3]
+        region = self.target_region
+        if region is None:
+            raise ValueError("target_region must be provided when intersec_mode='target_region'")
+
+        if torch.is_tensor(region):
+            mask = region.to(device=oimg.device)
+            if mask.ndim == 3 and mask.shape[0] == 1:
+                mask = mask.squeeze(0)
+            if mask.ndim != 2:
+                raise ValueError("target_region tensor must have shape [H, W] or [1, H, W]")
+            if mask.shape[0] != h or mask.shape[1] != w:
+                raise ValueError("target_region tensor shape must match input spatial size")
+            return mask.bool()
+
+        if isinstance(region, np.ndarray):
+            if region.ndim != 2 or region.shape[0] != h or region.shape[1] != w:
+                raise ValueError("target_region ndarray must have shape [H, W]")
+            return torch.from_numpy(region).to(device=oimg.device).bool()
+
+        if isinstance(region, (list, tuple)) and len(region) == 4:
+            y1, y2, x1, x2 = [int(v) for v in region]
+            y1 = max(0, min(y1, h))
+            y2 = max(0, min(y2, h))
+            x1 = max(0, min(x1, w))
+            x2 = max(0, min(x2, w))
+            if y2 <= y1 or x2 <= x1:
+                raise ValueError("target_region bbox must satisfy y2>y1 and x2>x1")
+            mask = torch.zeros((h, w), device=oimg.device, dtype=torch.bool)
+            mask[y1:y2, x1:x2] = True
+            return mask
+
+        raise ValueError("target_region must be one of: bbox tuple/list (y1,y2,x1,x2), [H,W] ndarray, or [H,W] tensor")
+
+    def _build_auto_low_region_mask(self, ref_explain_map):
+        ref = ref_explain_map
+        if ref.ndim == 3:
+            ref = ref[0]
+        ref = ref.to(torch.float32)
+        thr = torch.quantile(ref.reshape(-1), self.auto_region_percentile / 100.0)
+        mask = ref <= thr
+        # Ensure non-empty mask for numerical stability.
+        if not torch.any(mask):
+            flat = torch.zeros_like(ref, dtype=torch.bool).reshape(-1)
+            flat[torch.argmin(ref.reshape(-1))] = True
+            mask = flat.view_as(ref)
+        return mask
+
+    def _target_importance_objective_batch(self, saliency_maps, target_region_mask):
+        if saliency_maps.ndim == 2:
+            saliency_maps = saliency_maps.unsqueeze(0)
+
+        flat = saliency_maps.reshape(saliency_maps.size(0), -1)
+        region = target_region_mask.reshape(-1).to(flat.device)
+        if not torch.any(region):
+            return torch.zeros((flat.size(0),), device=flat.device, dtype=torch.float32)
+        mean_in_region = flat[:, region].mean(dim=1)
+        # Minimize negative importance to maximize importance in target region.
+        return -mean_in_region.to(torch.float32)
+
+    def _intersection_objective_batch(self, saliency_maps, ref_topk_idx, target_region_mask, target_topk_idx):
+        if self.intersec_mode == "reference":
+            return self._topk_intersection_ratio_batch(saliency_maps, ref_topk_idx)
+
+        if self.target_objective == "maximize_target_importance":
+            return self._target_importance_objective_batch(saliency_maps, target_region_mask)
+
+        target_inter = self._topk_intersection_ratio_batch(saliency_maps, target_topk_idx)
+        # Minimize negative intersection == maximize intersection with target map.
+        return -target_inter
 
     def _get_explain_map(self, x, target_class):
         method = str(self.explain_method).lower()
@@ -407,6 +538,17 @@ class NSGAII:
             "Unknown explain_method. Use one of: gradcam, simple_gradient, integrated_gradients"
         )
 
+    def _untargeted_margin_loss(self, logits, y_true):
+        # logits: [B, C], y_true: [B]
+        true_logit = logits.gather(1, y_true.view(-1, 1)).squeeze(1)
+        other_logits = logits.clone()
+        other_logits.scatter_(1, y_true.view(-1, 1), float("-inf"))
+        max_other = other_logits.max(dim=1).values
+        margin = true_logit - max_other
+        if self.cls_margin_kappa > 0:
+            return torch.clamp(margin, min=-self.cls_margin_kappa)
+        return margin
+
     def calculating_crowding_distance(self, F):
         infinity = 1e14
         n_points = F.shape[0]
@@ -449,28 +591,43 @@ class NSGAII:
         crowding[np.isinf(crowding)] = infinity
         return crowding
 
-    def modify_population(self, population, oimg, noise):
+    def modify_population(self, population, oimg, perturb_rgb):
         if population.ndim != 2:
             raise ValueError("population must have shape [P, H*W]")
         psize = population.shape[0]
         h, w = oimg.shape[2], oimg.shape[3]
+        if perturb_rgb.shape[0] != psize:
+            raise ValueError("perturb_rgb must have shape [P, C, H, W]")
         mask = population.view(psize, 1, h, w)
         base = oimg.expand(psize, -1, -1, -1)
-        n_batch = noise.expand(psize, -1, -1, -1)
-        batch = torch.where(mask, base + n_batch, base)
+        batch = torch.where(mask, base + perturb_rgb, base)
         return batch.clamp(oimg.min().item(), oimg.max().item())
 
-    def feval_population(self, population, oimg, noise, olabel, ref_topk_idx):
-        xp = self.modify_population(population, oimg, noise)
+    def feval_population(
+        self,
+        population,
+        oimg,
+        perturb_rgb,
+        olabel,
+        ref_topk_idx,
+        target_region_mask=None,
+        target_topk_idx=None,
+    ):
+        xp = self.modify_population(population, oimg, perturb_rgb)
 
         explain_maps, logits = self._get_explain_map(xp, target_class=olabel)
-        inter_ratio = self._topk_intersection_ratio_batch(explain_maps, ref_topk_idx)
+        inter_ratio = self._intersection_objective_batch(
+            explain_maps,
+            ref_topk_idx,
+            target_region_mask,
+            target_topk_idx,
+        )
         y = torch.full((logits.size(0),), int(olabel), device=logits.device, dtype=torch.long)
-        ce = self.ce_loss(logits, y)
+        cls_loss = self._untargeted_margin_loss(logits, y)
 
         return np.stack(
             [
-                ce.detach().cpu().numpy(),
+                cls_loss.detach().cpu().numpy(),
                 inter_ratio.detach().cpu().numpy(),
             ],
             axis=1,
@@ -491,9 +648,10 @@ class NSGAII:
             for i in range(self.pop_size):
                 sel = idxs[torch.randperm(idxs.numel(), device=oimg.device)[: self.active_n_pix]]
                 pop[i, sel] = True
-        return pop
+        rgb_pop = self._init_rgb_population(oimg, self.pop_size)
+        return pop, rgb_pop
 
-    def nsga2_selection(self, population, objectives, pop_size):
+    def nsga2_selection(self, population, population_rgb, objectives, pop_size):
         fronts = NonDominatedSorting().do(objectives, only_non_dominated_front=False)
         survivors = []
 
@@ -518,24 +676,44 @@ class NSGAII:
                 break
 
         next_population = population[survivors]
+        next_population_rgb = population_rgb[survivors]
         next_objectives = objectives[survivors]
-        return next_population, next_objectives, survivors, fronts
+        return next_population, next_population_rgb, next_objectives, survivors, fronts
 
     def solve(self, oimg, olabel, max_query=1000):
         if self.seed is not None:
             np.random.seed(self.seed)
 
         self.history = []
-        noise = self._sample_noise(oimg)
 
         # Reference explain map from original image for objective-2.
         ref_explain_map, _ = self._get_explain_map(oimg, target_class=int(olabel))
         ref_topk_idx = self._topk_idx(ref_explain_map)
+        target_region_mask = None
+        target_topk_idx = None
+        if self.intersec_mode == "target_region":
+            target_region_mask = self._build_target_region_mask(oimg)
+        elif self.intersec_mode == "auto_low_region":
+            target_region_mask = self._build_auto_low_region_mask(ref_explain_map)
 
-        population = self.init_population(oimg) # array of modified pixel indices
+        if self.intersec_mode in ("target_region", "auto_low_region"):
+            if target_region_mask is None:
+                raise ValueError("target_region_mask must not be None for target-region modes")
+            target_map = target_region_mask.to(ref_explain_map.device, dtype=torch.float32)
+            target_topk_idx = self._topk_idx(target_map)
+
+        population, population_rgb = self.init_population(oimg) # array of modified pixel indices + RGB perturbation tensors
 
         nqry = 0
-        objectives = self.feval_population(population, oimg, noise, olabel, ref_topk_idx)
+        objectives = self.feval_population(
+            population,
+            oimg,
+            population_rgb,
+            olabel,
+            ref_topk_idx,
+            target_region_mask=target_region_mask,
+            target_topk_idx=target_topk_idx,
+        )
         best_ce = np.min(objectives[:, 0])
         best_inter = np.min(objectives[:, 1])
 
@@ -549,29 +727,45 @@ class NSGAII:
                     "best_ce": float(np.min(objectives[:, 0])),
                     "best_intersection": float(np.min(objectives[:, 1])),
                     "rank0_objectives": objectives[r0].copy(),
+                    "rank0_rgb_abs_mean": float(population_rgb[r0].abs().mean().item()),
                 }
             )
 
         while nqry < max_query:
-            if self.noise_mode == "generation":
-                noise = self._sample_noise(oimg)
-
             offspring = []
+            offspring_rgb = []
             while len(offspring) < self.pop_size and nqry < max_query:
                 idxs = torch.randperm(population.shape[0], device=population.device)[:2]
-                child = self.recombine(population[idxs[0]], population[idxs[1]])
-                child = self.mutate(child)
+                child, child_rgb = self.recombine(
+                    population[idxs[0]],
+                    population[idxs[1]],
+                    population_rgb[idxs[0]],
+                    population_rgb[idxs[1]],
+                )
+                child, child_rgb = self.mutate(child, child_rgb)
                 offspring.append(child)
+                offspring_rgb.append(child_rgb)
 
             remaining = max_query - nqry
             offspring = offspring[:remaining]
+            offspring_rgb = offspring_rgb[:remaining]
             if len(offspring) == 0:
                 break
             offspring = torch.stack(offspring, dim=0)
-            offspring_obj = self.feval_population(offspring, oimg, noise, olabel, ref_topk_idx)
+            offspring_rgb = torch.stack(offspring_rgb, dim=0)
+            offspring_obj = self.feval_population(
+                offspring,
+                oimg,
+                offspring_rgb,
+                olabel,
+                ref_topk_idx,
+                target_region_mask=target_region_mask,
+                target_topk_idx=target_topk_idx,
+            )
             nqry += len(offspring)
 
             combined_pop = torch.cat([population, offspring], dim=0)
+            combined_pop_rgb = torch.cat([population_rgb, offspring_rgb], dim=0)
             if len(objectives) == 0:
                 combined_obj = offspring_obj
             else:
@@ -580,8 +774,9 @@ class NSGAII:
 
 
             # Keep this call as placeholder for your custom NSGA-II implementation.
-            population, objectives, _, fronts = self.nsga2_selection(
+            population, population_rgb, objectives, _, fronts = self.nsga2_selection(
                 combined_pop,
+                combined_pop_rgb,
                 combined_obj,
                 self.pop_size,
             )
@@ -597,6 +792,7 @@ class NSGAII:
                         "best_ce": float(best_ce),
                         "best_intersection": float(best_inter),
                         "rank0_objectives": objectives[r0].copy(),
+                        "rank0_rgb_abs_mean": float(population_rgb[r0].abs().mean().item()),
                     }
                 )
             
@@ -612,9 +808,9 @@ class NSGAII:
         else:
             best_idx = int(np.argmin(objectives[:, 1]))
 
-        adv = self.modify(population[best_idx], oimg, noise)
+        adv = self.modify(population[best_idx], oimg, population_rgb[best_idx])
         if len(rank0) > 0:
-            rank0_batch = self.modify_population(population[rank0], oimg, noise)
+            rank0_batch = self.modify_population(population[rank0], oimg, population_rgb[rank0])
             rank0_advs = [rank0_batch[i : i + 1] for i in range(rank0_batch.shape[0])]
         else:
             rank0_advs = []
