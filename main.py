@@ -12,7 +12,7 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 
-from algorithm import NSGAII
+from algorithm import GA, NSGAII
 from explain_method import get_gradcam_map, integrated_gradients, simple_gradient_map
 from util import get_torchvision_model
 
@@ -80,6 +80,20 @@ def parse_args() -> argparse.Namespace:
         help="Root output dir. Structure: output_root/<param_folder>/<class_id>/<image_name>/<sample_id>/...",
     )
     parser.add_argument("--skip-existing", action="store_true", help="Skip sample if summary.json already exists.")
+
+    parser.add_argument(
+        "--algorithm",
+        type=str,
+        default="nsgaii",
+        choices=["nsgaii", "ga"],
+        help="Attack algorithm: nsgaii (multi-objective) or ga (single-objective, margin loss only).",
+    )
+    parser.add_argument(
+        "--tournament-size",
+        type=int,
+        default=2,
+        help="Tournament size for GA selection (only used when --algorithm=ga).",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +112,7 @@ def _sanitize(value: str) -> str:
 
 def _build_param_folder(args: argparse.Namespace) -> str:
     parts = [
+        f"algo={args.algorithm}",
         f"model={args.model}",
         f"method={args.explain_method}",
         f"n={args.n_pix}",
@@ -249,7 +264,8 @@ def main() -> None:
                 logits = model(oimg)
                 olabel = int(logits.argmax(dim=1).item())
 
-            attacker = NSGAII(
+            attacker_cls = GA if args.algorithm == "ga" else NSGAII
+            attacker_kwargs = dict(
                 model=model,
                 model_name=args.model,
                 n=args.n_pix,
@@ -267,6 +283,9 @@ def main() -> None:
                 target_objective=args.target_objective,
                 seed=args.seed + idx,
             )
+            if args.algorithm == "ga":
+                attacker_kwargs["tournament_size"] = args.tournament_size
+            attacker = attacker_cls(**attacker_kwargs)
 
             adv, rank0_advs, population, objectives, nqry, rank0 = attacker.solve(
                 oimg=oimg,
