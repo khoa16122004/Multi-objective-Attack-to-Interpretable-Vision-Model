@@ -817,3 +817,196 @@ class NSGAII:
         return adv, rank0_advs, population, objectives, nqry, rank0
 
 
+class GA(NSGAII):
+    """Single-objective GA that minimises margin loss only.
+
+    Explain maps are still computed inside feval_population (using the same
+    _get_explain_map call as NSGAII) and the intersection ratio is recorded in
+    history alongside the CE loss — but it does NOT influence selection.
+
+    Tournament selection replaces NSGA-II selection as the survivor mechanism.
+    The returned signature matches NSGAII.solve for drop-in compatibility:
+        adv, rank0_advs, population, objectives, nqry, rank0
+    where rank0 contains only the single best individual.
+    """
+
+    def __init__(
+        self,
+        model,
+        model_name,
+        n=4,
+        pop_size=20,
+        cr=0.9,
+        mu=0.01,
+        topk=200,
+        explain_method="gradcam",
+        ig_steps=100,
+        noise_std=1.0,
+        noise_mode="generation",
+        rgb_mutation_std=None,
+        intersec_mode="reference",
+        target_region=None,
+        auto_region_percentile=30.0,
+        target_objective="maximize_target_intersection",
+        seed=None,
+        tournament_size=2,
+    ):
+        super().__init__(
+            model=model,
+            model_name=model_name,
+            n=n,
+            pop_size=pop_size,
+            cr=cr,
+            mu=mu,
+            topk=topk,
+            explain_method=explain_method,
+            ig_steps=ig_steps,
+            noise_std=noise_std,
+            noise_mode=noise_mode,
+            rgb_mutation_std=rgb_mutation_std,
+            intersec_mode=intersec_mode,
+            target_region=target_region,
+            auto_region_percentile=auto_region_percentile,
+            target_objective=target_objective,
+            seed=seed,
+        )
+        self.tournament_size = max(2, int(tournament_size))
+
+    # feval_population is inherited from NSGAII unchanged:
+    #   - still calls _get_explain_map to compute explain maps
+    #   - still returns [P, 2]: column 0 = margin loss, column 1 = intersection ratio
+    # The intersection ratio (col 1) is only recorded in history, never used for selection.
+
+    def tournament_selection(self, population, population_rgb, objectives, pop_size):
+        """Survivor selection: binary tournament on margin loss (objectives[:, 0]) only."""
+        fitness = objectives[:, 0]
+        n = len(fitness)
+        k = min(self.tournament_size, n)
+        survivors = []
+        for _ in range(pop_size):
+            candidates = np.random.choice(n, size=k, replace=False)
+            winner = int(candidates[np.argmin(fitness[candidates])])
+            survivors.append(winner)
+        survivors = np.array(survivors, dtype=np.int64)
+        return (
+            population[survivors],
+            population_rgb[survivors],
+            objectives[survivors],
+            survivors.tolist(),
+        )
+
+    def solve(self, oimg, olabel, max_query=1000):
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        self.history = []
+
+        # Reference explain map from original image for objective-2 recording.
+        ref_explain_map, _ = self._get_explain_map(oimg, target_class=int(olabel))
+        ref_topk_idx = self._topk_idx(ref_explain_map)
+        target_region_mask = None
+        target_topk_idx = None
+        if self.intersec_mode == "target_region":
+            target_region_mask = self._build_target_region_mask(oimg)
+        elif self.intersec_mode == "auto_low_region":
+            target_region_mask = self._build_auto_low_region_mask(ref_explain_map)
+
+        if self.intersec_mode in ("target_region", "auto_low_region"):
+            if target_region_mask is None:
+                raise ValueError("target_region_mask must not be None for target-region modes")
+            target_map = target_region_mask.to(ref_explain_map.device, dtype=torch.float32)
+            target_topk_idx = self._topk_idx(target_map)
+
+        population, population_rgb = self.init_population(oimg)
+
+        nqry = 0
+        objectives = self.feval_population(
+            population,
+            oimg,
+            population_rgb,
+            olabel,
+            ref_topk_idx,
+            target_region_mask=target_region_mask,
+            target_topk_idx=target_topk_idx,
+        )
+        nqry += len(population)
+
+        if objectives.size > 0:
+            best_idx = int(np.argmin(objectives[:, 0]))
+            self.history.append(
+                {
+                    "nqry": int(nqry),
+                    "best_ce": float(objectives[best_idx, 0]),
+                    "best_intersection": float(objectives[best_idx, 1]),
+                    "rank0_objectives": objectives[[best_idx]].copy(),
+                    "rank0_rgb_abs_mean": float(population_rgb[best_idx].abs().mean().item()),
+                }
+            )
+
+        while nqry < max_query:
+            offspring = []
+            offspring_rgb = []
+            while len(offspring) < self.pop_size and nqry < max_query:
+                idxs = torch.randperm(population.shape[0], device=population.device)[:2]
+                child, child_rgb = self.recombine(
+                    population[idxs[0]],
+                    population[idxs[1]],
+                    population_rgb[idxs[0]],
+                    population_rgb[idxs[1]],
+                )
+                child, child_rgb = self.mutate(child, child_rgb)
+                offspring.append(child)
+                offspring_rgb.append(child_rgb)
+
+            remaining = max_query - nqry
+            offspring = offspring[:remaining]
+            offspring_rgb = offspring_rgb[:remaining]
+            if len(offspring) == 0:
+                break
+            offspring = torch.stack(offspring, dim=0)
+            offspring_rgb = torch.stack(offspring_rgb, dim=0)
+            offspring_obj = self.feval_population(
+                offspring,
+                oimg,
+                offspring_rgb,
+                olabel,
+                ref_topk_idx,
+                target_region_mask=target_region_mask,
+                target_topk_idx=target_topk_idx,
+            )
+            nqry += len(offspring)
+
+            combined_pop = torch.cat([population, offspring], dim=0)
+            combined_pop_rgb = torch.cat([population_rgb, offspring_rgb], dim=0)
+            combined_obj = (
+                np.concatenate([objectives, offspring_obj], axis=0)
+                if len(objectives) > 0
+                else offspring_obj
+            )
+
+            population, population_rgb, objectives, _ = self.tournament_selection(
+                combined_pop,
+                combined_pop_rgb,
+                combined_obj,
+                self.pop_size,
+            )
+
+            if objectives.size > 0:
+                best_idx = int(np.argmin(objectives[:, 0]))
+                self.history.append(
+                    {
+                        "nqry": int(nqry),
+                        "best_ce": float(objectives[best_idx, 0]),
+                        "best_intersection": float(objectives[best_idx, 1]),
+                        "rank0_objectives": objectives[[best_idx]].copy(),
+                        "rank0_rgb_abs_mean": float(population_rgb[best_idx].abs().mean().item()),
+                    }
+                )
+
+        best_idx = int(np.argmin(objectives[:, 0]))
+        adv = self.modify(population[best_idx], oimg, population_rgb[best_idx])
+        rank0 = [best_idx]
+        rank0_advs = [adv]
+        return adv, rank0_advs, population, objectives, nqry, rank0
+
+
