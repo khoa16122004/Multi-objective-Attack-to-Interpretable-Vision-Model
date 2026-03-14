@@ -252,6 +252,8 @@ class NSGAII:
         topk=200,
         explain_method="gradcam",
         ig_steps=100,
+        noise_std=1.0,
+        noise_mode="generation",
         seed=None,
     ):
         self.model = model
@@ -263,9 +265,17 @@ class NSGAII:
         self.topk = topk
         self.explain_method = explain_method
         self.ig_steps = ig_steps
+        self.noise_std = float(noise_std)
+        self.noise_mode = str(noise_mode).lower()
         self.seed = seed
 
+        if self.noise_mode not in ("fixed", "generation"):
+            raise ValueError("noise_mode must be one of: fixed, generation")
+
         self.ce_loss = torch.nn.CrossEntropyLoss(reduction="none")
+
+    def _sample_noise(self, oimg):
+        return torch.randn_like(oimg) * self.noise_std
 
     def convert1D_to_2D(self, idx, wi):
         c1 = idx // wi
@@ -275,44 +285,51 @@ class NSGAII:
     def convert2D_to_1D(self, x, y, wi):
         return x * wi + y
 
-    def masking(self, oimg, timg):
-        xo = torch.abs(oimg - timg)
-        d = torch.zeros(xo.shape[2], xo.shape[3], dtype=torch.bool, device=xo.device)
-        for i in range(xo.shape[1]):
-            d = (xo[0, i] > 0.0) | d
-
+    def masking(self, oimg):
         wi = oimg.shape[2]
-        p = np.where(d.int().detach().cpu().numpy() == 1)
-        return self.convert2D_to_1D(p[0], p[1], wi)
+        he = oimg.shape[3]
+        return torch.arange(wi * he, device=oimg.device, dtype=torch.long)
 
-    def recombine(self, p0, p1, p2):
-        cross_points = np.random.rand(len(p1)) < self.cr
-        if not np.any(cross_points):
-            cross_points[np.random.randint(0, len(p1))] = True
-        trial = np.where(cross_points, p1, p2).astype(int)
-        trial = np.logical_and(p0, trial).astype(int)
-        return trial
+    def recombine(self, p1, p2):
+        cross_points = torch.rand(p1.numel(), device=p1.device) < self.cr
+        if not torch.any(cross_points):
+            cross_points[torch.randint(0, p1.numel(), (1,), device=p1.device)] = True
+        trial = torch.where(cross_points, p1, p2)
+        return self._project_sparse(trial)
 
-    def mutate(self, p):
-        outp = p.copy()
-        if p.sum() != 0:
-            one = np.where(outp == 1)[0]
-            n_px = int(len(one) * self.mu)
-            if n_px == 0:
-                n_px = 1
-            n_px = min(n_px, len(one))
-            idx = np.random.choice(one, n_px, replace=False)
-            outp[idx] = 0
+    def _project_sparse(self, p):
+        outp = p.clone()
+        target = int(getattr(self, "active_n_pix", self.n_pix))
+        target = max(0, min(target, outp.numel()))
+
+        one = torch.where(outp)[0]
+        if one.numel() > target:
+            n_off = int(one.numel() - target)
+            off_idx = one[torch.randperm(one.numel(), device=outp.device)[:n_off]]
+            outp[off_idx] = False
+        elif one.numel() < target:
+            zero = torch.where(~outp)[0]
+            if zero.numel() > 0:
+                on_cnt = min(target - int(one.numel()), int(zero.numel()))
+                on_idx = zero[torch.randperm(zero.numel(), device=outp.device)[:on_cnt]]
+                outp[on_idx] = True
+
         return outp
 
-    def modify(self, pop, oimg, timg):
-        wi = oimg.shape[2]
-        # Genome convention: 1 -> take pixel from timg (perturbed), 0 -> keep original pixel.
-        img = oimg.clone()
-        p = np.where(pop == 1)
-        c1, c2 = self.convert1D_to_2D(p[0], wi)
-        img[:, :, c1, c2] = timg[:, :, c1, c2]
-        return img
+    def mutate(self, p):
+        outp = p.clone()
+        n_flip = int(max(1, round(outp.numel() * self.mu)))
+        n_flip = min(n_flip, outp.numel())
+        idx = torch.randperm(outp.numel(), device=outp.device)[:n_flip]
+        outp[idx] = ~outp[idx]
+        return self._project_sparse(outp)
+
+    def modify(self, pop, oimg, noise):
+        # Genome convention: 1 -> perturb this pixel, 0 -> keep original pixel.
+        mask = pop.view(1, 1, oimg.shape[2], oimg.shape[3])
+        perturbed = oimg + noise
+        img = torch.where(mask, perturbed, oimg)
+        return img.clamp(oimg.min().item(), oimg.max().item())
 
     def _forward_logits(self, x):
         out = self.model(x)
@@ -432,20 +449,19 @@ class NSGAII:
         crowding[np.isinf(crowding)] = infinity
         return crowding
 
-    def modify_population(self, population, oimg, timg):
-        batch = oimg.repeat(len(population), 1, 1, 1)
-        wi = oimg.shape[2]
-        src = timg[0]
+    def modify_population(self, population, oimg, noise):
+        if population.ndim != 2:
+            raise ValueError("population must have shape [P, H*W]")
+        psize = population.shape[0]
+        h, w = oimg.shape[2], oimg.shape[3]
+        mask = population.view(psize, 1, h, w)
+        base = oimg.expand(psize, -1, -1, -1)
+        n_batch = noise.expand(psize, -1, -1, -1)
+        batch = torch.where(mask, base + n_batch, base)
+        return batch.clamp(oimg.min().item(), oimg.max().item())
 
-        for i, pop in enumerate(population):
-            p = np.where(pop == 1)
-            c1, c2 = self.convert1D_to_2D(p[0], wi)
-            batch[i, :, c1, c2] = src[:, c1, c2]
-
-        return batch
-
-    def feval_population(self, population, oimg, timg, olabel, ref_topk_idx):
-        xp = self.modify_population(population, oimg, timg)
+    def feval_population(self, population, oimg, noise, olabel, ref_topk_idx):
+        xp = self.modify_population(population, oimg, noise)
 
         explain_maps, logits = self._get_explain_map(xp, target_class=olabel)
         inter_ratio = self._topk_intersection_ratio_batch(explain_maps, ref_topk_idx)
@@ -460,26 +476,21 @@ class NSGAII:
             axis=1,
         ).astype(np.float32)
 
-    def init_population(self, oimg, timg):
+    def init_population(self, oimg):
         if self.seed is not None:
             np.random.seed(self.seed)
+            torch.manual_seed(self.seed)
 
         wi = oimg.shape[2]
         he = oimg.shape[3]
-        base = np.zeros(wi * he).astype(int)
-        idxs = self.masking(oimg, timg)
-        max_candidates = len(idxs)
-        if max_candidates < self.n_pix:
-            self.n_pix = int(max_candidates)
+        idxs = self.masking(oimg) # return array index của tất cả pixel
+        self.active_n_pix = int(max(0, min(self.n_pix, len(idxs))))
 
-        pop = []
-        for _ in range(self.pop_size):
-            p = base.copy()
-            if len(idxs) > 0 and self.n_pix > 0:
-                n = min(self.n_pix, len(idxs))
-                add_idx = np.random.choice(idxs, n, replace=False)
-                p[add_idx] = 1
-            pop.append(p)
+        pop = torch.zeros((self.pop_size, wi * he), dtype=torch.bool, device=oimg.device)
+        if self.active_n_pix > 0:
+            for i in range(self.pop_size):
+                sel = idxs[torch.randperm(idxs.numel(), device=oimg.device)[: self.active_n_pix]]
+                pop[i, sel] = True
         return pop
 
     def nsga2_selection(self, population, objectives, pop_size):
@@ -506,41 +517,49 @@ class NSGAII:
             if len(survivors) >= pop_size:
                 break
 
-        next_population = [population[i] for i in survivors]
+        next_population = population[survivors]
         next_objectives = objectives[survivors]
         return next_population, next_objectives, survivors, fronts
 
-    def solve(self, oimg, timg, olabel, max_query=1000):
+    def solve(self, oimg, olabel, max_query=1000):
         if self.seed is not None:
             np.random.seed(self.seed)
 
         self.history = []
+        noise = self._sample_noise(oimg)
 
         # Reference explain map from original image for objective-2.
         ref_explain_map, _ = self._get_explain_map(oimg, target_class=int(olabel))
         ref_topk_idx = self._topk_idx(ref_explain_map)
 
-        population = self.init_population(oimg, timg)
+        population = self.init_population(oimg) # array of modified pixel indices
 
         nqry = 0
-        init_count = min(len(population), max_query - nqry)
-        population = population[:init_count]
-        objectives = self.feval_population(population, oimg, timg, olabel, ref_topk_idx)
+        objectives = self.feval_population(population, oimg, noise, olabel, ref_topk_idx)
+        best_ce = np.min(objectives[:, 0])
+        best_inter = np.min(objectives[:, 1])
+
+
         nqry += len(population)
         if objectives.size > 0:
+            r0 = NonDominatedSorting().do(objectives, only_non_dominated_front=True)
             self.history.append(
                 {
                     "nqry": int(nqry),
                     "best_ce": float(np.min(objectives[:, 0])),
                     "best_intersection": float(np.min(objectives[:, 1])),
+                    "rank0_objectives": objectives[r0].copy(),
                 }
             )
 
         while nqry < max_query:
+            if self.noise_mode == "generation":
+                noise = self._sample_noise(oimg)
+
             offspring = []
             while len(offspring) < self.pop_size and nqry < max_query:
-                idxs = np.random.choice(len(population), 3, replace=False)
-                child = self.recombine(population[idxs[0]], population[idxs[1]], population[idxs[2]])
+                idxs = torch.randperm(population.shape[0], device=population.device)[:2]
+                child = self.recombine(population[idxs[0]], population[idxs[1]])
                 child = self.mutate(child)
                 offspring.append(child)
 
@@ -548,14 +567,17 @@ class NSGAII:
             offspring = offspring[:remaining]
             if len(offspring) == 0:
                 break
-            offspring_obj = self.feval_population(offspring, oimg, timg, olabel, ref_topk_idx)
+            offspring = torch.stack(offspring, dim=0)
+            offspring_obj = self.feval_population(offspring, oimg, noise, olabel, ref_topk_idx)
             nqry += len(offspring)
 
-            combined_pop = population + offspring
+            combined_pop = torch.cat([population, offspring], dim=0)
             if len(objectives) == 0:
                 combined_obj = offspring_obj
             else:
                 combined_obj = np.concatenate([objectives, offspring_obj], axis=0)
+
+
 
             # Keep this call as placeholder for your custom NSGA-II implementation.
             population, objectives, _, fronts = self.nsga2_selection(
@@ -565,25 +587,37 @@ class NSGAII:
             )
 
             if objectives.size > 0:
+                best_ce = np.min(objectives[:, 0])
+                best_inter = np.min(objectives[:, 1])
+                r0 = NonDominatedSorting().do(objectives, only_non_dominated_front=True)
+
                 self.history.append(
                     {
                         "nqry": int(nqry),
-                        "best_ce": float(np.min(objectives[:, 0])),
-                        "best_intersection": float(np.min(objectives[:, 1])),
+                        "best_ce": float(best_ce),
+                        "best_intersection": float(best_inter),
+                        "rank0_objectives": objectives[r0].copy(),
                     }
                 )
+            
+            print("nqry: {}, best_ce: {:.4f}, best_intersection: {:.4f}".format(nqry, best_ce, best_inter))
 
         fronts = NonDominatedSorting().do(objectives, only_non_dominated_front=False)
         rank0 = fronts[0].tolist() if len(fronts) > 0 else []
 
-        # Representative return: the one with minimum CE in rank-0 (or entire pop if needed).
+        # Representative return: individual with minimum top-k intersection.
         if len(rank0) > 0:
-            best_local = int(np.argmin(objectives[rank0, 0]))
+            best_local = int(np.argmin(objectives[rank0, 1]))
             best_idx = int(rank0[best_local])
         else:
-            best_idx = int(np.argmin(objectives[:, 0]))
+            best_idx = int(np.argmin(objectives[:, 1]))
 
-        adv = self.modify(population[best_idx], oimg, timg)
-        return adv, population, objectives, nqry, rank0
+        adv = self.modify(population[best_idx], oimg, noise)
+        if len(rank0) > 0:
+            rank0_batch = self.modify_population(population[rank0], oimg, noise)
+            rank0_advs = [rank0_batch[i : i + 1] for i in range(rank0_batch.shape[0])]
+        else:
+            rank0_advs = []
+        return adv, rank0_advs, population, objectives, nqry, rank0
 
 

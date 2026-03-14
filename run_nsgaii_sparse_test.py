@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument("--pop-size", type=int, default=50)
     parser.add_argument("--cr", type=float, default=0.9)
     parser.add_argument("--mu", type=float, default=0.9)
-    parser.add_argument("--topk", type=int, default=1000)
+    parser.add_argument("--topk", type=int, default=10000)
     parser.add_argument(
         "--explain-method",
         type=str,
@@ -32,10 +32,16 @@ def parse_args():
         choices=["gradcam", "simple_gradient", "integrated_gradients"],
         help="Explanation method for objective-2.",
     )
-    parser.add_argument("--ig-steps", type=int, default=100, help="Used when explain-method=integrated_gradients.")
+    parser.add_argument("--ig-steps", type=int, default=5, help="Used when explain-method=integrated_gradients.")
     parser.add_argument("--max-query", type=int, default=100000, help="Maximum number of queries.")
-    parser.add_argument("--target-image", type=str, default="", help="Optional reference image path for sparse mixing.")
-    parser.add_argument("--noise-std", type=float, default=1.0, help="Used when target image is not provided.")
+    parser.add_argument("--noise-std", type=float, default=1.0, help="Std of Gaussian noise on selected sparse pixels.")
+    parser.add_argument(
+        "--noise-mode",
+        type=str,
+        default="generation",
+        choices=["fixed", "generation"],
+        help="Noise sampling mode: fixed once per run, or resample each generation.",
+    )
     parser.add_argument("--out-dir", type=str, default="eval_test")
     return parser.parse_args()
 
@@ -97,17 +103,6 @@ def main():
         logits = model(oimg)
         olabel = int(logits.argmax(dim=1).item())
 
-    if args.target_image:
-        timg_pil = Image.open(args.target_image).convert("RGB")
-        timg_vis = sptransform(timg_pil).unsqueeze(0).to(device)
-        if normtransform is not None:
-            timg = normtransform(timg_vis.squeeze(0)).unsqueeze(0)
-        else:
-            timg = timg_vis.clone()
-    else:
-        noise = torch.randn_like(oimg) * float(args.noise_std)
-        timg = (oimg + noise).clamp(oimg.min().item(), oimg.max().item())
-
     attacker = NSGAII(
         model=model,
         model_name=args.model,
@@ -118,12 +113,13 @@ def main():
         topk=args.topk,
         explain_method=args.explain_method,
         ig_steps=args.ig_steps,
+        noise_std=args.noise_std,
+        noise_mode=args.noise_mode,
         seed=args.seed,
     )
 
-    adv, population, objectives, nqry, rank0 = attacker.solve(
+    adv, rank0_advs, population, objectives, nqry, rank0 = attacker.solve(
         oimg=oimg,
-        timg=timg,
         olabel=olabel,
         max_query=args.max_query,
     )
@@ -222,6 +218,52 @@ def main():
         plt.savefig(out_dir / "nsga2_score_curves.png", dpi=200)
         plt.close()
 
+    # Save all rank-0 adversarial images and saliency maps as a grid
+    if len(rank0_advs) > 0:
+        n_rank0 = len(rank0_advs)
+        ncols = min(n_rank0, 5)
+        nrows = (n_rank0 + ncols - 1) // ncols
+        rank0_batch = torch.cat(rank0_advs, dim=0)
+        with torch.no_grad():
+            rank0_preds = model(rank0_batch).argmax(dim=1).detach().cpu().numpy()
+
+        # Grid: adv images
+        fig_adv, axes_adv = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+        axes_adv = np.array(axes_adv).reshape(-1)
+        for k, adv_k in enumerate(rank0_advs):
+            adv_k_vis = to_vis_space(adv_k, normtransform)
+            pred_k = int(rank0_preds[k])
+            ce_k = float(objectives[rank0[k], 0])
+            inter_k = float(objectives[rank0[k], 1])
+            axes_adv[k].imshow(adv_k_vis[0].permute(1, 2, 0).cpu())
+            axes_adv[k].set_title(f"pred={pred_k}\nCE={ce_k:.2f} Int={inter_k:.2f}", fontsize=7)
+            axes_adv[k].axis("off")
+        for k in range(n_rank0, len(axes_adv)):
+            axes_adv[k].axis("off")
+        fig_adv.suptitle(f"Rank-0 Adversarial Images ({n_rank0} individuals)", fontsize=10)
+        plt.tight_layout()
+        plt.savefig(out_dir / "nsga2_rank0_advs.png", dpi=150)
+        plt.close()
+
+        # Grid: saliency maps
+        fig_sal, axes_sal = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+        axes_sal = np.array(axes_sal).reshape(-1)
+        method_title = args.explain_method.replace("_", " ").title()
+        for k, adv_k in enumerate(rank0_advs):
+            sal_k = get_explain_map_for_vis(
+                model, args.model, adv_k, olabel, args.explain_method, args.ig_steps
+            )
+            inter_k = float(objectives[rank0[k], 1])
+            axes_sal[k].imshow(sal_k[0].detach().cpu().numpy(), cmap="hot")
+            axes_sal[k].set_title(f"{method_title}\nInt={inter_k:.2f}", fontsize=7)
+            axes_sal[k].axis("off")
+        for k in range(n_rank0, len(axes_sal)):
+            axes_sal[k].axis("off")
+        fig_sal.suptitle(f"Rank-0 Saliency Maps ({n_rank0} individuals)", fontsize=10)
+        plt.tight_layout()
+        plt.savefig(out_dir / "nsga2_rank0_saliency.png", dpi=150)
+        plt.close()
+
     print("=== NSGA-II Sparse Attack Finished ===")
     print("Queries:", nqry)
     print("Original label:", olabel)
@@ -231,6 +273,9 @@ def main():
     print("Rank-0 size:", len(rank0))
     print("Saved:", out_dir / "nsga2_sparse_result.png")
     print("Saved:", out_dir / "nsga2_adv_image.png")
+    if len(rank0_advs) > 0:
+        print("Saved:", out_dir / "nsga2_rank0_advs.png")
+        print("Saved:", out_dir / "nsga2_rank0_saliency.png")
     if len(attacker.history) > 0:
         print("Saved:", out_dir / "nsga2_score_curves.png")
     print("Saved:", out_dir / "nsga2_sparse_stats.pt")
