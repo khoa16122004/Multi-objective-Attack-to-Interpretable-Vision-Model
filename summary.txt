@@ -1,0 +1,7 @@
+result_dir: /kaggle/input/datasets/khoatrnnht/mapr-test/Multi-objective-Attack-to-Interpretable-Vision-Model/samples_100class_results/model_resnet18__method_gradcam__n_500__pop_100__q_100000__topk_10000__mode_reference__obj_maximize_target_intersection__noise_1.0__seed_0
+num_runs: 100
+ASR_percent: 33.0000
+final_margin_mean: 1.950382
+final_margin_std: 2.761218
+final_intersection_mean: 0.854873
+final_intersection_std: 0.136504

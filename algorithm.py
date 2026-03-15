@@ -801,12 +801,15 @@ class NSGAII:
         fronts = NonDominatedSorting().do(objectives, only_non_dominated_front=False)
         rank0 = fronts[0].tolist() if len(fronts) > 0 else []
 
-        # Representative return: individual with minimum top-k intersection.
-        if len(rank0) > 0:
-            best_local = int(np.argmin(objectives[rank0, 1]))
-            best_idx = int(rank0[best_local])
+        # Representative return policy:
+        # 1) among successful attacks (margin < 0), choose minimum intersection;
+        # 2) if none successful, choose minimum margin.
+        success_idx = np.where(objectives[:, 0] < 0.0)[0]
+        if len(success_idx) > 0:
+            best_local = int(np.argmin(objectives[success_idx, 1]))
+            best_idx = int(success_idx[best_local])
         else:
-            best_idx = int(np.argmin(objectives[:, 1]))
+            best_idx = int(np.argmin(objectives[:, 0]))
 
         adv = self.modify(population[best_idx], oimg, population_rgb[best_idx])
         if len(rank0) > 0:
