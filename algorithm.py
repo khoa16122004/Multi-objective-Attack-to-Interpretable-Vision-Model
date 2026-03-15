@@ -399,10 +399,13 @@ class NSGAII:
             raise ValueError("topk must be >= 1")
 
         cur_idx = torch.topk(flat, k=k, dim=1, largest=True).indices
-        ref_idx = ref_topk_idx.view(1, -1).to(cur_idx.device)
-        matches = (cur_idx.unsqueeze(2) == ref_idx.unsqueeze(1)).any(dim=2)
-        inter_counts = matches.sum(dim=1).to(torch.float32)
-        return inter_counts / float(ref_idx.size(1))
+        # Memory-efficient intersection: use a boolean mask O(B*k) instead of
+        # the naive O(B*k*ref_k) broadcast comparison which creates a huge tensor.
+        n_total = flat.size(1)
+        ref_mask = torch.zeros(n_total, dtype=torch.bool, device=cur_idx.device)
+        ref_mask[ref_topk_idx] = True
+        inter_counts = ref_mask[cur_idx].sum(dim=1).to(torch.float32)
+        return inter_counts / float(ref_topk_idx.size(0))
 
     def _topk_in_region_ratio_batch(self, saliency_maps, region_mask):
         if saliency_maps.ndim == 2:

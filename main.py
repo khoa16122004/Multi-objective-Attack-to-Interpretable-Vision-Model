@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-pix", type=int, default=40)
     parser.add_argument("--pop-size", type=int, default=50)
     parser.add_argument("--cr", type=float, default=0.9)
-    parser.add_argument("--mu", type=float, default=0.9)
+    parser.add_argument("--mu", type=float, default=0.01)
     parser.add_argument("--topk", type=int, default=10000)
     parser.add_argument(
         "--explain-method",
