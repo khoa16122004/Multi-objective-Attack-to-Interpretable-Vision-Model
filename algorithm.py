@@ -680,6 +680,37 @@ class NSGAII:
         next_objectives = objectives[survivors]
         return next_population, next_population_rgb, next_objectives, survivors, fronts
 
+    def _append_history(self, nqry, objectives, rank0_indices, population_rgb, best_margin_so_far, best_objective2_so_far):
+        if objectives.size == 0:
+            return best_margin_so_far, best_objective2_so_far
+
+        current_best_margin = float(np.min(objectives[:, 0]))
+        current_best_objective2 = float(np.min(objectives[:, 1]))
+        best_margin_so_far = min(best_margin_so_far, current_best_margin)
+        best_objective2_so_far = min(best_objective2_so_far, current_best_objective2)
+
+        rank0_idx = np.asarray(rank0_indices, dtype=np.int64).reshape(-1)
+        rank0_rgb_abs_mean = 0.0
+        rank0_objectives = np.empty((0, objectives.shape[1]), dtype=objectives.dtype)
+        if rank0_idx.size > 0:
+            rank0_objectives = objectives[rank0_idx].copy()
+            rank0_rgb_abs_mean = float(population_rgb[rank0_idx].abs().mean().item())
+
+        self.history.append(
+            {
+                "nqry": int(nqry),
+                "current_best_margin": current_best_margin,
+                "current_best_objective2": current_best_objective2,
+                "best_margin": float(best_margin_so_far),
+                "best_objective2": float(best_objective2_so_far),
+                "best_ce": float(best_margin_so_far),
+                "best_intersection": float(best_objective2_so_far),
+                "rank0_objectives": rank0_objectives,
+                "rank0_rgb_abs_mean": rank0_rgb_abs_mean,
+            }
+        )
+        return best_margin_so_far, best_objective2_so_far
+
     def solve(self, oimg, olabel, max_query=1000):
         if self.seed is not None:
             np.random.seed(self.seed)
@@ -714,21 +745,19 @@ class NSGAII:
             target_region_mask=target_region_mask,
             target_topk_idx=target_topk_idx,
         )
-        best_ce = np.min(objectives[:, 0])
-        best_inter = np.min(objectives[:, 1])
-
+        best_margin_so_far = np.inf
+        best_objective2_so_far = np.inf
 
         nqry += len(population)
         if objectives.size > 0:
             r0 = NonDominatedSorting().do(objectives, only_non_dominated_front=True)
-            self.history.append(
-                {
-                    "nqry": int(nqry),
-                    "best_ce": float(np.min(objectives[:, 0])),
-                    "best_intersection": float(np.min(objectives[:, 1])),
-                    "rank0_objectives": objectives[r0].copy(),
-                    "rank0_rgb_abs_mean": float(population_rgb[r0].abs().mean().item()),
-                }
+            best_margin_so_far, best_objective2_so_far = self._append_history(
+                nqry,
+                objectives,
+                r0,
+                population_rgb,
+                best_margin_so_far,
+                best_objective2_so_far,
             )
 
         while nqry < max_query:
@@ -782,21 +811,15 @@ class NSGAII:
             )
 
             if objectives.size > 0:
-                best_ce = np.min(objectives[:, 0])
-                best_inter = np.min(objectives[:, 1])
                 r0 = NonDominatedSorting().do(objectives, only_non_dominated_front=True)
-
-                self.history.append(
-                    {
-                        "nqry": int(nqry),
-                        "best_ce": float(best_ce),
-                        "best_intersection": float(best_inter),
-                        "rank0_objectives": objectives[r0].copy(),
-                        "rank0_rgb_abs_mean": float(population_rgb[r0].abs().mean().item()),
-                    }
+                best_margin_so_far, best_objective2_so_far = self._append_history(
+                    nqry,
+                    objectives,
+                    r0,
+                    population_rgb,
+                    best_margin_so_far,
+                    best_objective2_so_far,
                 )
-            
-            # print("nqry: {}, best_ce: {:.4f}, best_intersection: {:.4f}".format(nqry, best_ce, best_inter))
 
         fronts = NonDominatedSorting().do(objectives, only_non_dominated_front=False)
         rank0 = fronts[0].tolist() if len(fronts) > 0 else []
@@ -934,16 +957,17 @@ class GA(NSGAII):
         )
         nqry += len(population)
 
+        best_margin_so_far = np.inf
+        best_objective2_so_far = np.inf
         if objectives.size > 0:
             best_idx = int(np.argmin(objectives[:, 0]))
-            self.history.append(
-                {
-                    "nqry": int(nqry),
-                    "best_ce": float(objectives[best_idx, 0]),
-                    "best_intersection": float(objectives[best_idx, 1]),
-                    "rank0_objectives": objectives[[best_idx]].copy(),
-                    "rank0_rgb_abs_mean": float(population_rgb[best_idx].abs().mean().item()),
-                }
+            best_margin_so_far, best_objective2_so_far = self._append_history(
+                nqry,
+                objectives,
+                [best_idx],
+                population_rgb,
+                best_margin_so_far,
+                best_objective2_so_far,
             )
 
         while nqry < max_query:
@@ -996,14 +1020,13 @@ class GA(NSGAII):
 
             if objectives.size > 0:
                 best_idx = int(np.argmin(objectives[:, 0]))
-                self.history.append(
-                    {
-                        "nqry": int(nqry),
-                        "best_ce": float(objectives[best_idx, 0]),
-                        "best_intersection": float(objectives[best_idx, 1]),
-                        "rank0_objectives": objectives[[best_idx]].copy(),
-                        "rank0_rgb_abs_mean": float(population_rgb[best_idx].abs().mean().item()),
-                    }
+                best_margin_so_far, best_objective2_so_far = self._append_history(
+                    nqry,
+                    objectives,
+                    [best_idx],
+                    population_rgb,
+                    best_margin_so_far,
+                    best_objective2_so_far,
                 )
 
         best_idx = int(np.argmin(objectives[:, 0]))

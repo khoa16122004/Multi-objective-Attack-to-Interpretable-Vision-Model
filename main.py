@@ -365,20 +365,32 @@ def main() -> None:
 
             if len(attacker.history) > 0:
                 q = [h["nqry"] for h in attacker.history]
-                ce_curve = [h["best_ce"] for h in attacker.history]
-                inter_curve = [h["best_intersection"] for h in attacker.history]
+                margin_curve = [h.get("best_margin", h["best_ce"]) for h in attacker.history]
+                objective2_curve = [h.get("best_objective2", h["best_intersection"]) for h in attacker.history]
+
+                objective2_title = "Best Objective-2 vs Query"
+                objective2_ylabel = "Objective-2"
+                if args.intersec_mode == "reference":
+                    objective2_title = "Best Top-k Intersection vs Query"
+                    objective2_ylabel = "Intersection Ratio"
+                elif args.target_objective == "maximize_target_intersection":
+                    objective2_title = "Best Target Intersection Objective vs Query"
+                    objective2_ylabel = "Negative Intersection"
+                elif args.target_objective == "maximize_target_importance":
+                    objective2_title = "Best Target Importance Objective vs Query"
+                    objective2_ylabel = "Negative Importance"
 
                 fig2, axes2 = plt.subplots(1, 2, figsize=(10, 4))
-                axes2[0].plot(q, ce_curve, marker="", linewidth=1.5)
-                axes2[0].set_title("Best CE vs Query")
+                axes2[0].plot(q, margin_curve, marker="", linewidth=1.5)
+                axes2[0].set_title("Best Margin vs Query")
                 axes2[0].set_xlabel("Queries")
-                axes2[0].set_ylabel("Cross-Entropy")
+                axes2[0].set_ylabel("Margin")
                 axes2[0].grid(True, alpha=0.3)
 
-                axes2[1].plot(q, inter_curve, marker="", linewidth=1.5)
-                axes2[1].set_title("Best Top-k Intersection vs Query")
+                axes2[1].plot(q, objective2_curve, marker="", linewidth=1.5)
+                axes2[1].set_title(objective2_title)
                 axes2[1].set_xlabel("Queries")
-                axes2[1].set_ylabel("Intersection Ratio")
+                axes2[1].set_ylabel(objective2_ylabel)
                 axes2[1].grid(True, alpha=0.3)
 
                 plt.tight_layout()
@@ -399,10 +411,10 @@ def main() -> None:
                 for k, adv_k in enumerate(rank0_advs):
                     adv_k_vis = to_vis_space(adv_k, normtransform)
                     pred_k = int(rank0_preds[k])
-                    ce_k = float(objectives[rank0[k], 0])
+                    margin_k = float(objectives[rank0[k], 0])
                     inter_k = float(objectives[rank0[k], 1])
                     axes_adv[k].imshow(adv_k_vis[0].permute(1, 2, 0).cpu())
-                    axes_adv[k].set_title(f"pred={pred_k}\\nCE={ce_k:.2f} Int={inter_k:.2f}", fontsize=7)
+                    axes_adv[k].set_title(f"pred={pred_k}\\nMargin={margin_k:.2f} Obj2={inter_k:.2f}", fontsize=7)
                     axes_adv[k].axis("off")
                 for k in range(n_rank0, len(axes_adv)):
                     axes_adv[k].axis("off")
@@ -434,6 +446,7 @@ def main() -> None:
                 plt.savefig(sample_dir / "nsga2_rank0_saliency.png", dpi=150)
                 plt.close()
 
+            last_history = attacker.history[-1] if len(attacker.history) > 0 else None
             summary = {
                 "sample_id": sample_id,
                 "class_id": class_id,
@@ -451,8 +464,9 @@ def main() -> None:
                 "changed_pixels": int(changed_pixels),
                 "rank0_size": int(len(rank0)),
                 "population_size": int(population.shape[0]),
-                "best_ce": float(np.min(objectives[:, 0])) if objectives.size > 0 else None,
-                "best_objective2": float(np.min(objectives[:, 1])) if objectives.size > 0 else None,
+                "best_margin": float(last_history["best_margin"]) if last_history is not None else None,
+                "best_ce": float(last_history["best_margin"]) if last_history is not None else None,
+                "best_objective2": float(last_history["best_objective2"]) if last_history is not None else None,
             }
             with open(summary_path, "w", encoding="utf-8") as f:
                 json.dump(summary, f, indent=2, ensure_ascii=False)

@@ -10,13 +10,11 @@ import pickle
 
 # Fixed input folder (no argparse). Change this path when needed.
 RESULT_DIR = Path(
-	"/kaggle/input/datasets/khoatrnnht/mapr-test/Multi-objective-Attack-to-Interpretable-Vision-Model/"
-	"samples_100class_results/model_resnet18__method_gradcam__n_500__pop_100__q_100000__topk_10000"
-	"__mode_reference__obj_maximize_target_intersection__noise_1.0__seed_0"
+	r"D:\Multi-objective-Attack-to-Interpretable-Vision-Model\results"
 )
 
 # Output folder for analysis artifacts.
-OUT_DIR = RESULT_DIR / "analysis_fixed"
+OUT_DIR = Path("analysis_fixed")
 
 
 def select_by_rule(objectives: np.ndarray) -> tuple[int, float, float, bool]:
@@ -149,10 +147,17 @@ def analyze_result_folder(result_dir: Path, out_dir: Path) -> None:
 			i_list = [i_fin]
 			s_list = [1.0 if s_fin else 0.0]
 
+		# Convert to best-so-far curves so they are monotone:
+		# margin & intersection lower = better → cumulative min.
+		# success rate higher = better → cumulative max.
+		m_arr = np.minimum.accumulate(np.asarray(m_list, dtype=np.float64))
+		i_arr = np.minimum.accumulate(np.asarray(i_list, dtype=np.float64))
+		s_arr = np.maximum.accumulate(np.asarray(s_list, dtype=np.float64))
+
 		per_run_queries.append(np.asarray(q_list, dtype=np.int64))
-		per_run_margin_curve.append(np.asarray(m_list, dtype=np.float64))
-		per_run_inter_curve.append(np.asarray(i_list, dtype=np.float64))
-		per_run_success_curve.append(np.asarray(s_list, dtype=np.float64))
+		per_run_margin_curve.append(m_arr)
+		per_run_inter_curve.append(i_arr)
+		per_run_success_curve.append(s_arr)
 
 	if len(per_run_queries) == 0:
 		raise RuntimeError("No valid runs found in sparse_stats payloads.")
